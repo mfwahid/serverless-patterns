@@ -1,16 +1,283 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: Serverless patterns - Service to Service description
+AWSTemplateFormatVersion: "2010-09-09"
+Description: sample
+Parameters:
+  IotcoreEndpoint:
+    Description: Iotcore endpoint for the respective region
+    Type: String
+  UserPoolName:
+    Description: Pool name
+    Type: String
 
-# Comment on each global 
-Globals:
-
-
-# Comment each resource section to explain usage
 Resources:
+  SnsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cognito-idp.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSNSFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: CustomSmsSenderLambdaKMSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: "*"
+
+  CognitoUserPool:
+    Type: "AWS::Cognito::UserPool"
+    Properties:
+      UserPoolName: !Ref UserPoolName
+      AutoVerifiedAttributes:
+        - phone_number
+      UsernameAttributes:
+        - phone_number
+      SmsConfiguration:
+        SnsCallerArn: !GetAtt SnsRole.Arn
+
+  CognitoUserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      AllowedOAuthFlowsUserPoolClient: True
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - phone
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      ClientName: CognitoAppClient
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+      UserPoolId: !Ref CognitoUserPool
+
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: MyQueue
+
+  EventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: deviceid
+          AttributeType: S
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 10
+      KeySchema:
+        - AttributeName: deviceid
+          KeyType: HASH
+      TableName: SIBPOSLookup
+      SSESpecification:
+        SSEEnabled: true
+
+  MyApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SampleApi
+
+  APIResources:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyApi
+      ParentId: !GetAtt
+        - MyApi
+        - RootResourceId
+      PathPart: postmessagetosqs/
+
+  APIMethods:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyApi
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      ResourceId: !GetAtt
+        - APIResources
+        - ResourceId
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri:
+          Fn::Join:
+            - ""
+            - - "arn:aws:apigateway:"
+              - !Ref "AWS::Region"
+              - ":sqs:path//"
+              - !GetAtt MyQueue.Arn
+      MethodResponses:
+        - StatusCode: 200
+
+  MyDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: APIMethods
+    Properties:
+      RestApiId: !Ref MyApi
+      StageName: prod
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt MyLambdaExecutionRole.Arn
+      Runtime: nodejs16.x
+      Environment:
+        IOTENDPOINT: !Ref IotcoreEndpoint
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const docClient = new AWS.DynamoDB.DocumentClient();
+          var iotdata = new AWS.IotData({endpoint: '<replace-it>'});
+          async function lookupDeviceTopic(id){
+            try {
+              
+              const params = {
+                TableName : 'SIBPOSLookup',
+                Key: {
+                  deviceid: id
+                }
+              }
+
+              const data = await docClient.get(params).promise()
+              var response = JSON.stringify(data);
+              var result = JSON.parse(response);
+              var topic = result["Item"]["Topic"];
+              return topic
+            } catch (err) {
+              return err
+            }
+          }
+
+          const publishMessage = async (params) => {
+            return new Promise((resolve, reject) => {
+              iotdata.publish(params, function(err, data){
+                if(err){
+                  console.log(err);
+                  reject(err)
+                }
+                else{
+                  console.log("success?");
+                  resolve(params)
+                }
+              })
+            })
+          }
+
+          exports.handler = async function(event, context) {
+            
+            try {  
+             for (let record of event.Records) {
+                    const { body } = record;
+                    var result = JSON.parse(body)
+                    //console.log(body);
+                    var clientID = result.ClientID
+                    var message = JSON.stringify(result)
+                    console.log(clientID)
+                    console.log(message)
+                    const devicetopic = await lookupDeviceTopic(clientID)
+                    console.log(devicetopic)
+                    
+                    var params = {
+                       topic: devicetopic,
+                       payload: message,
+                       qos: 0
+                    }
+                    
+                    JSON.stringify(await publishMessage(params))
+              
+                  }
+            }catch (err) {
+              return { error: err }
+            }
 
 
-# List all common outputs for usage
+            /*await asyncForEach(event.Records, async (record) => {
+              const { body } = record;
+              var result = JSON.parse(body)
+              //console.log(body);
+              var clientID = result.ClientID
+              var message = JSON.stringify(result)
+              console.log(clientID)
+              console.log(message)
+              const devicetopic = await lookupDeviceTopic(clientID)
+              console.log(devicetopic)
+            });*/
+            /*event.Records.forEach(record => {
+              const { body } = record;
+              var result = JSON.parse(body)
+              //console.log(body);
+              var clientID = result.ClientID
+              var message = JSON.stringify(result)
+              console.log(clientID)
+              console.log(message)
+              const devicetopic = await lookupDeviceTopic(clientID)
+              console.log(devicetopic)
+            });*/
+            return {
+              statusCode: 200,
+              body: "Success"
+            };
+          }
+
+  MyLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  MyPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt MyLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "sqs.amazonaws.com"
+      SourceArn: !GetAtt MyQueue.Arn
+
+  AuthorizersCognitoUserPools:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref MyApi
+      IdentitySource: method.request.header.authorizationToken
+      ProviderARNs:
+        - !Ref CognitoUserPool
+
 Outputs:
-
-
+  # API Gateway endpoint to be used during tests
+  AppApiEndpoint:
+    Description: API Endpoint
+    Value: !Sub "https://${MyApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
